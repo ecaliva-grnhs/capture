@@ -63,6 +63,80 @@ test('rate limiting is enforced in the database, not per-instance', () => {
   assert.match(sql, /function check_rate_limit/);
 });
 
+// Regression guards for "ERROR: 42P17: generation expression is not immutable".
+// A GENERATED column's expression must be strictly IMMUTABLE; several
+// plausible-looking builtins are only STABLE and fail at CREATE time on a
+// fresh database — which is exactly how this bit us.
+
+/** Strip `--` line comments so prose about a trap isn't mistaken for the trap. */
+function withoutComments(text) {
+  return text
+    .split('\n')
+    .map((line) => line.replace(/--.*$/, ''))
+    .join('\n');
+}
+
+/** The expression text of every `generated always as (...) stored` column. */
+function generatedExpressions(text) {
+  return [
+    ...withoutComments(text).matchAll(
+      /generated\s+always\s+as\s*\(([\s\S]*?)\)\s*stored/gi
+    ),
+  ].map((m) => m[1]);
+}
+
+test('no generated column uses a STABLE function', () => {
+  // convert_to() depends on database encoding; array_to_string() and the
+  // text[]->text cast depend on element output functions. All are STABLE.
+  const stableFns = ['convert_to', 'array_to_string', '::text)'];
+  const expressions = generatedExpressions(sql);
+  assert.ok(expressions.length > 0, 'expected at least one generated column');
+  for (const expr of expressions) {
+    for (const fn of stableFns) {
+      assert.ok(
+        !expr.includes(fn),
+        `generated column expression uses non-immutable "${fn}": ${expr.trim()}`
+      );
+    }
+  }
+});
+
+test('body_hash uses the immutable ::bytea cast, not convert_to', () => {
+  assert.match(sql, /encode\(sha256\(body::bytea\), 'hex'\)/);
+  assert.ok(
+    !/convert_to/.test(withoutComments(sql)),
+    'convert_to() is STABLE and cannot appear in executable SQL here'
+  );
+});
+
+test('body_tsv is trigger-maintained, not generated', () => {
+  // Flattening tags[] has no immutable formulation, so the vector is
+  // maintained by a trigger and backfilled for pre-existing rows.
+  assert.match(sql, /add column if not exists body_tsv tsvector;/);
+  assert.match(sql, /create trigger entries_tsv_update/);
+  assert.match(sql, /before insert or update of body, summary, tags/);
+  assert.match(sql, /update entries[\s\S]*?set body_tsv = entries_search_vector/);
+});
+
+test('full-text indexing uses an explicit regconfig', () => {
+  // to_tsvector(text) is STABLE; to_tsvector(regconfig, text) is IMMUTABLE.
+  const calls = [...sql.matchAll(/to_tsvector\(([^,)]*)/g)].map((m) => m[1].trim());
+  assert.ok(calls.length > 0);
+  for (const arg of calls) {
+    assert.equal(arg, "'english'", `to_tsvector called without a regconfig: ${arg}`);
+  }
+});
+
+test('triggers are dropped before creation so re-runs do not error', () => {
+  for (const trigger of ['entries_tsv_update', 'entries_set_updated_at']) {
+    assert.match(
+      sql,
+      new RegExp(`drop trigger if exists ${trigger} on entries;`),
+      `${trigger} must be dropped before create`
+    );
+  }
+});
+
 test('schema is idempotent — no bare creates that would fail on re-run', () => {
   const bareCreateTable = /create table (?!if not exists)/i.test(sql);
   const bareCreateIndex = /create index (?!if not exists)/i.test(sql);

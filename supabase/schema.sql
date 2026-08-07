@@ -26,7 +26,7 @@ create table if not exists entries (
 -- Added after v1 — `add column if not exists` keeps upgrades painless.
 
 -- Set when an entry was saved but enrichment (tagging/embedding) failed, so a
--- backfill pass can find and repair it. Null once the entry is fully enriched.
+-- backfill pass can find and repair it.
 alter table entries
   add column if not exists needs_enrichment boolean not null default false;
 
@@ -35,19 +35,78 @@ alter table entries
 
 -- Stable hash of the body, used to collapse duplicate captures (a
 -- double-tapped Shortcut) without a unique constraint that would hard-fail.
+--
+-- NOTE: `body::bytea`, not `convert_to(body, 'UTF8')`. convert_to() is marked
+-- STABLE (its result depends on the database encoding), and a generated column
+-- requires a strictly IMMUTABLE expression — Postgres rejects the table with
+-- "ERROR: 42P17: generation expression is not immutable". The cast is
+-- immutable and, on a UTF8 database (Supabase's default), produces identical
+-- bytes, so this still matches Node's sha256(body, 'utf8') in lib/ingest.js.
 alter table entries
   add column if not exists body_hash text
-  generated always as (encode(sha256(convert_to(body, 'UTF8')), 'hex')) stored;
+  generated always as (encode(sha256(body::bytea), 'hex')) stored;
 
--- Lexical search vector. Weighted: summary/tags (A) outrank the body (B) so a
--- direct topical hit beats an incidental mention.
+-- Lexical search vector, weighted so summary/tags (A) outrank the body (B).
+--
+-- Trigger-maintained rather than GENERATED: flattening `tags` requires
+-- array_to_string(), which is STABLE (array element output functions are not
+-- guaranteed immutable), and every inline alternative — array_to_string,
+-- tags::text — trips the same immutability check. A trigger has no such
+-- restriction and keeps the weighting in one place.
 alter table entries
-  add column if not exists body_tsv tsvector
-  generated always as (
-    setweight(to_tsvector('english', coalesce(summary, '')), 'A') ||
-    setweight(to_tsvector('english', array_to_string(tags, ' ')), 'A') ||
-    setweight(to_tsvector('english', coalesce(body, '')), 'B')
-  ) stored;
+  add column if not exists body_tsv tsvector;
+
+-- Single source of truth for the search vector: used by both the trigger and
+-- the backfill below. Plain functions carry no immutability requirement.
+create or replace function entries_search_vector(
+  p_summary text,
+  p_tags    text[],
+  p_body    text
+)
+returns tsvector
+language sql
+stable
+as $$
+  select setweight(to_tsvector('english', coalesce(p_summary, '')), 'A')
+      || setweight(to_tsvector('english', coalesce(array_to_string(p_tags, ' '), '')), 'A')
+      || setweight(to_tsvector('english', coalesce(p_body, '')), 'B');
+$$;
+
+create or replace function entries_set_search_vector()
+returns trigger
+language plpgsql
+as $$
+begin
+  new.body_tsv := entries_search_vector(new.summary, new.tags, new.body);
+  return new;
+end;
+$$;
+
+drop trigger if exists entries_tsv_update on entries;
+create trigger entries_tsv_update
+  before insert or update of body, summary, tags on entries
+  for each row execute function entries_set_search_vector();
+
+create or replace function set_updated_at()
+returns trigger
+language plpgsql
+as $$
+begin
+  new.updated_at = now();
+  return new;
+end;
+$$;
+
+drop trigger if exists entries_set_updated_at on entries;
+create trigger entries_set_updated_at
+  before update on entries
+  for each row execute function set_updated_at();
+
+-- Populate the vector for any pre-existing rows. No-op once current, so
+-- re-running the file costs nothing.
+update entries
+   set body_tsv = entries_search_vector(summary, tags, body)
+ where body_tsv is null;
 
 -- Reverse-chron feed
 create index if not exists entries_created_at_idx
@@ -73,21 +132,6 @@ create index if not exists entries_body_hash_idx
 create index if not exists entries_needs_enrichment_idx
   on entries (created_at)
   where needs_enrichment;
-
-create or replace function set_updated_at()
-returns trigger
-language plpgsql
-as $$
-begin
-  new.updated_at = now();
-  return new;
-end;
-$$;
-
-drop trigger if exists entries_set_updated_at on entries;
-create trigger entries_set_updated_at
-  before update on entries
-  for each row execute function set_updated_at();
 
 -- ---------------------------------------------------------------------------
 -- Search
