@@ -233,7 +233,76 @@ textarea {
   margin: 0 2px;
 }
 
+/* ---- Edit / delete row actions ---- */
+.row-actions {
+  display: flex;
+  gap: 6px;
+}
+.row-actions.inline {
+  margin-left: auto;
+}
+.row-actions button {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-faint);
+  border-radius: 8px;
+  padding: 3px 9px;
+  font-size: 0.76rem;
+}
+.row-actions button:hover {
+  color: var(--text);
+  border-color: var(--text-faint);
+}
+.row-actions button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.row-actions button.danger {
+  color: var(--danger);
+  border-color: rgba(240, 106, 106, 0.4);
+}
+.card.editing textarea {
+  width: 100%;
+  min-height: 110px;
+  resize: vertical;
+  background: var(--bg);
+  border: 1px solid var(--accent);
+  color: var(--text);
+  border-radius: var(--radius);
+  padding: 12px;
+  font-size: 0.95rem;
+  outline: none;
+}
+.card.editing .edit-note {
+  color: var(--text-faint);
+  font-size: 0.75rem;
+  margin: 8px 0 10px;
+}
+.card.editing .row-actions {
+  justify-content: flex-end;
+}
+.card.pending {
+  opacity: 0.72;
+  border-style: dashed;
+}
+.meta .warn {
+  color: #d9a441;
+}
+
 /* ---- States ---- */
+.notice {
+  background: var(--accent-soft);
+  border: 1px solid rgba(139, 124, 246, 0.35);
+  color: var(--accent);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  font-size: 0.85rem;
+  margin-bottom: 12px;
+}
+.queued-feed {
+  margin-bottom: 12px;
+}
 .empty,
 .loading {
   text-align: center;
@@ -361,6 +430,67 @@ textarea {
   opacity: 0.5;
 }
 
+/* ---- Token gate ---- */
+.gate {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100dvh;
+  padding-bottom: calc(var(--safe-bottom) + 16px);
+}
+.gate-card {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 24px 20px;
+  width: 100%;
+  max-width: 380px;
+}
+.gate-card h1 {
+  margin: 0 0 8px;
+  font-size: 1.3rem;
+  letter-spacing: -0.02em;
+}
+.gate-hint {
+  color: var(--text-faint);
+  font-size: 0.85rem;
+  margin: 0 0 16px;
+}
+.gate-hint code {
+  color: var(--text-dim);
+  background: var(--bg-elev-2);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 0.8rem;
+}
+.gate-card input {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  font-size: 1rem;
+  outline: none;
+  margin-bottom: 12px;
+}
+.gate-card input:focus {
+  border-color: var(--accent);
+}
+.gate-card button {
+  width: 100%;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  color: #fff;
+  border-radius: var(--radius);
+  padding: 13px;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+.gate-card button:disabled {
+  opacity: 0.5;
+}
+
 @media (min-width: 600px) {
   .sheet-backdrop {
     align-items: center;
@@ -368,5 +498,13 @@ textarea {
   .sheet {
     border-radius: 18px;
     margin: 0 16px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
   }
 }

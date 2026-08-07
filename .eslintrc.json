@@ -1,0 +1,15 @@
+{
+  "extends": "next/core-web-vitals",
+  "ignorePatterns": ["node_modules/", ".next/", "out/", "build/"],
+  "overrides": [
+    {
+      "files": ["public/sw.js"],
+      "env": { "serviceworker": true, "browser": true },
+      "parserOptions": { "ecmaVersion": 2022, "sourceType": "script" }
+    },
+    {
+      "files": ["tests/**/*.js"],
+      "env": { "node": true, "es2022": true }
+    }
+  ]
+}

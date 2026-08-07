@@ -3,101 +3,154 @@
 A personal, single-user thought-capture app. Jot a thought from an Apple
 Shortcut or the PWA; Claude auto-tags it and writes a one-line summary; the
 body is embedded for semantic search. Browse a reverse-chronological feed,
-search by meaning, and filter by tag.
+search by meaning *or* keyword, and filter by tag.
 
 **Stack:** Next.js (App Router) on Vercel · Supabase (Postgres + pgvector) ·
 Claude API for auto-tagging · Voyage AI for embeddings.
+
+## Design guarantees
+
+Two properties drive most of the code:
+
+**A capture is never lost to someone else's outage.** Tagging and embedding run
+concurrently and are settled independently — if Claude is overloaded or Voyage
+times out, the entry is still written, flagged `needs_enrichment`, and repaired
+later by the backfill pass. If the *network* is down, the PWA writes the thought
+to an IndexedDB outbox and replays it on reconnect. The only way to lose a
+thought is for Postgres itself to be unreachable, which answers 503 so the
+client can retry.
+
+**The API fails closed.** Every route requires `CAPTURE_TOKEN`. If it is unset,
+requests are refused rather than served openly — "single user, no auth" means
+no accounts, not an open database. The Supabase service-role key bypasses RLS,
+so this token is the real access control.
 
 ## How it works
 
 ```
 Apple Shortcut / PWA
-        │  POST /api/entries { body, source?, url? }
+        │  POST /api/entries  { body, source?, url? }
+        │  x-capture-token: <CAPTURE_TOKEN>
         ▼
-   ┌─────────────────────────────────────────┐
-   │ Claude  → tags[] + one-line summary      │  (parallel)
-   │ Voyage  → 1024-dim embedding of body     │
-   └─────────────────────────────────────────┘
-        │  insert row
+   dedupe (sha256 of body, within DEDUPE_WINDOW_SEC)
+        │
         ▼
-   Supabase `entries` (Postgres + pgvector)
+   ┌──────────────────────────────────────────────┐
+   │ Claude  → tags[] + one-line summary          │  concurrent,
+   │ Voyage  → 1024-dim embedding                 │  independently settled
+   └──────────────────────────────────────────────┘
+        │  insert (always — a failed arm degrades to null)
+        ▼
+   Supabase `entries` (Postgres + pgvector + tsvector)
         ▲
-        │  GET /api/entries  (reverse-chron feed, tag filter)
-        │  GET /api/search   (embed query → cosine ranking via match_entries)
-        │  GET /api/tags     (tag counts for filter chips)
+        │  GET  /api/entries   reverse-chron feed, tag filter, cursor paging
+        │  GET  /api/search    hybrid: vector + full-text, fused with RRF
+        │  GET  /api/tags      filter-aware tag counts
+        │  PATCH/DELETE /api/entries/:id
+        │  GET/POST /api/maintenance/backfill   repair degraded entries
         ▼
-   Responsive PWA feed
+   Responsive PWA feed (installable, offline-capable)
 ```
 
 ## Setup
 
 ### 1. Database
 
-In the Supabase SQL editor, run [`supabase/schema.sql`](supabase/schema.sql).
-It creates the `entries` table, the pgvector index, and the `match_entries` /
-`tag_counts` RPCs.
+Run [`supabase/schema.sql`](supabase/schema.sql) in the Supabase SQL editor. It
+is idempotent — safe on a fresh project or over an earlier version.
 
-> The embedding column is `vector(1024)` to match Voyage `voyage-3.5`. If you
-> change the embedding model/dimension, update both the schema and the RPC.
+> The embedding column is `vector(1024)` to match Voyage `voyage-3.5`. Changing
+> the embedding model means changing the column and `search_entries()` together;
+> `npm test` asserts the schema and the client agree.
 
 ### 2. Environment
 
-Copy `.env.example` to `.env.local` and fill in the values:
+Copy `.env.example` to `.env.local` and fill it in.
 
-| Var | What |
-| --- | --- |
-| `SUPABASE_URL` | Project URL |
-| `SUPABASE_SERVICE_ROLE_KEY` | Service-role key (server-only) |
-| `ANTHROPIC_API_KEY` | Claude API key |
-| `VOYAGE_API_KEY` | Voyage AI key (embeddings) |
-| `INGEST_SECRET` | Optional shared secret guarding `POST /api/entries` |
-| `CLAUDE_MODEL` / `VOYAGE_MODEL` | Optional model overrides |
+| Var | Required | What |
+| --- | --- | --- |
+| `CAPTURE_TOKEN` | **yes** | Shared secret for every API route. `openssl rand -base64 32` |
+| `SUPABASE_URL` | **yes** | Project URL |
+| `SUPABASE_SERVICE_ROLE_KEY` | **yes** | Service-role key (server-only) |
+| `ANTHROPIC_API_KEY` | **yes** | Claude API key |
+| `VOYAGE_API_KEY` | **yes** | Voyage AI key (embeddings) |
+| `CRON_SECRET` | no | Set by Vercel Cron; also accepted by the backfill route |
+| `CLAUDE_MODEL`, `VOYAGE_MODEL` | no | Model overrides |
+| `ENRICH_TIMEOUT_MS` | no | Per-call enrichment budget (default 9000) |
+| `MAX_BODY_CHARS` | no | Ingest size cap (default 20000) |
+| `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW_SEC` | no | Default 60 per 60s |
+| `DEDUPE_WINDOW_SEC` | no | Duplicate collapse window (default 300) |
+
+`GET /api/health` is unauthenticated and lists which required variables are
+missing (names only, never values) — that's how you tell a misconfigured deploy
+apart from a wrong token.
 
 ### 3. Run
 
 ```bash
 npm install
-npm run dev
+npm run dev     # http://localhost:3000
+npm test        # 44 unit tests, no network or database needed
+npm run lint
 ```
+
+The PWA asks for the capture token once and stores it in `localStorage`.
 
 ### 4. Deploy
 
-Push to a Git repo and import into Vercel. Add the same environment variables
-in the Vercel project settings. No build config needed — Next.js is detected
-automatically.
+Import the repo into Vercel and add the same environment variables. The
+included `vercel.json` schedules the hourly backfill; set `CRON_SECRET` in
+Vercel so the cron can authenticate.
 
 ## API
 
+All routes require `x-capture-token: <CAPTURE_TOKEN>` (or
+`Authorization: Bearer <CAPTURE_TOKEN>`), except `GET /api/health`.
+
 ### `POST /api/entries`
 
-Ingest a thought. This is what the Apple Shortcut calls.
+Ingest a thought — this is what the Apple Shortcut calls.
 
 ```jsonc
-// Request
+// Request — only "body" is required
 { "body": "text of the thought", "source": "shortcut", "url": "https://…" }
-// only "body" is required
 
-// Response 201
-{ "entry": { "id", "body", "tags", "summary", "source", "url", "created_at" } }
+// 201 Created (200 if it collapsed into a recent duplicate)
+{ "entry": { … }, "duplicate": false, "degraded": false }
 ```
 
-If `INGEST_SECRET` is set, send it as `Authorization: Bearer <secret>` (or an
-`x-ingest-secret` header).
+`degraded: true` means the entry saved but tagging or embedding failed; the
+backfill pass will repair it. `url` must be `http(s)` — other schemes are
+rejected, since the feed renders it as a link.
 
 ### `GET /api/entries?tag=…&limit=30&before=<iso>`
 
-Reverse-chronological feed. Repeat `tag` to require multiple tags. `before` is
-a `created_at` cursor for pagination; the response includes `nextCursor`.
+Reverse-chronological feed. Repeat `tag` to require **all** of them. `before`
+is a `created_at` cursor; the response carries `nextCursor`.
 
-### `GET /api/search?q=…&tag=…&limit=20`
+### `GET /api/search?q=…&tag=…&limit=20&offset=0`
 
-Semantic search. Embeds `q` and ranks entries by cosine similarity, optionally
-constrained to entries overlapping the given tags. Each result includes a
-`similarity` score in `[0,1]`.
+Hybrid search. The query is embedded for semantic matching *and* passed as text
+for full-text matching; the two rankings are fused with Reciprocal Rank Fusion,
+so "that thing about deadlines slipping" and an exact error string both find
+their entry. Tag filtering is AND, matching the feed. `semantic: false` in the
+response means the embedding provider was unavailable and results are
+keyword-only.
 
-### `GET /api/tags`
+### `PATCH /api/entries/:id` · `DELETE /api/entries/:id`
 
-Distinct tags with usage counts, most-used first.
+Edit or remove an entry. Changing `body` re-runs tagging and re-embeds, so
+search stays consistent with the text; explicitly supplied `tags`/`summary`
+override the regenerated values.
+
+### `GET /api/tags?tag=…`
+
+Tag counts for the filter chips, scoped to any tags already selected.
+
+### `GET|POST /api/maintenance/backfill?limit=10`
+
+Repair entries saved while enrichment was unavailable. Processes a small batch
+per call and reports `remaining`; the Vercel cron runs it hourly.
 
 ## Apple Shortcut
 
@@ -105,12 +158,25 @@ Create a Shortcut with a **Get Contents of URL** action:
 
 - **URL:** `https://<your-app>.vercel.app/api/entries`
 - **Method:** `POST`
-- **Headers:** `Content-Type: application/json` (and, if you set one,
-  `Authorization: Bearer <INGEST_SECRET>`)
+- **Headers:**
+  - `Content-Type: application/json`
+  - `x-capture-token: <your CAPTURE_TOKEN>`
 - **Request Body (JSON):**
   - `body` → Shortcut Input / dictated text
   - `source` → `"shortcut"` (optional)
-  - `url` → the current Safari URL, when sharing a page (optional)
+  - `url` → the current Safari URL when sharing a page (optional)
 
 Add it to the Share Sheet and/or Home Screen to capture from anywhere.
-```
+
+## Notes
+
+- **Embeddings come from Voyage, not Claude** — Anthropic ships no embeddings
+  endpoint, and Voyage is its recommended provider. That is a third vendor in
+  the write path, which is exactly why enrichment is failure-tolerant.
+- **Rate limiting lives in Postgres**, not in process memory: serverless
+  instances don't share state, so an in-process counter would only limit
+  whichever instance happened to answer.
+- **The service worker is network-first for navigations.** A cache-first HTML
+  shell goes stale on deploy and points at hashed chunks that no longer exist,
+  which shows up as a blank screen. Only immutable `/_next/static/*` is
+  cache-first.

@@ -1,25 +1,27 @@
-import { NextResponse } from 'next/server';
 import { getSupabase } from '@/lib/supabase';
+import { requireCaptureToken } from '@/lib/auth';
+import { jsonOk, route } from '@/lib/http';
 
 export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
 /**
- * GET /api/tags
- * Distinct tags with usage counts, most-used first — powers the filter chips.
+ * GET /api/tags?tag=…
+ *
+ * Tag usage counts for the filter chips. When tags are already selected the
+ * counts are computed over that subset, so a chip shows how many entries you'd
+ * still have if you added it rather than a misleading global total.
  */
-export async function GET() {
-  try {
-    const supabase = getSupabase();
-    const { data, error } = await supabase.rpc('tag_counts');
-    if (error) {
-      return NextResponse.json({ error: error.message }, { status: 500 });
-    }
-    return NextResponse.json({ tags: data || [] });
-  } catch (err) {
-    console.error('GET /api/tags failed:', err);
-    return NextResponse.json(
-      { error: err.message || 'Internal error' },
-      { status: 500 }
-    );
-  }
-}
+export const GET = route('GET /api/tags', async (req) => {
+  requireCaptureToken(req);
+
+  const { searchParams } = new URL(req.url);
+  const tags = searchParams.getAll('tag').filter(Boolean);
+
+  const { data, error } = await getSupabase().rpc('tag_counts', {
+    filter_tags: tags.length ? tags : null,
+  });
+
+  if (error) throw error;
+  return jsonOk({ tags: data || [] });
+});
